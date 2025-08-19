@@ -4,7 +4,7 @@ A series of models for protein related tasks, including zero-shot [protein stabi
 ## Installation
 
 ```bash
-git clone https://github.com/Wublab/Pythia.git
+git clone https://github.com/nunziati/pythia-sadic.git
 cd Pythia
 pip install -e .
 ```
