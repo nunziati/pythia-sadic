@@ -23,6 +23,7 @@ class ProtBB:
         chain: list,
         bb_ang: list,
         sasa: list,
+        sadic: list,
     ) -> None:
         self.ca = Tensor(np.array(ca)).unsqueeze(1)  # L, 1, 3
         self.cb = Tensor(np.array(cb)).unsqueeze(1)  # L, 1, 3
@@ -34,6 +35,7 @@ class ProtBB:
         self.chain_num = Tensor(np.array(chain))  # L, 1
         self.bb_ang = Tensor(np.array(bb_ang))  # L, 6
         self.sasa = Tensor(np.array(sasa))  # L, 5
+        self.sadic = Tensor(np.array(sadic))  # L, 5
 
 
 def mk_zero_prot(l: int):
@@ -48,6 +50,7 @@ def mk_zero_prot(l: int):
         chain=torch.zeros((l, 1), dtype=torch.long),
         bb_ang=torch.zeros((l, 6)),
         sasa=torch.zeros((l, 5)),
+        sadic=torch.zeros((l, 5)),
     )
     return protbb
 
@@ -63,6 +66,7 @@ def read_pdb_to_protbb(pdb_file: str):
     chains = []
     bb_ang = []
     sasa = []
+    sadic = []
     try:
         if pdb_file.endswith(".pdb"):
             parser = PDBParser(QUIET=True)
@@ -88,6 +92,7 @@ def read_pdb_to_protbb(pdb_file: str):
             ) and residue.id[0] == " ":
                 try:
                     cb = residue["CB"].coord
+                    cb_sadic = residue["CB"].get_bfactor()
                 except:
                     b = residue["CA"].coord - residue["N"].coord
                     c_ = residue["C"].coord - residue["CA"].coord
@@ -98,6 +103,7 @@ def read_pdb_to_protbb(pdb_file: str):
                         - 0.54067466 * c_
                         + residue["CA"].coord
                     )
+                    cb_sadic = np.mean([residue[atom_name].get_bfactor() for atom_name in ["N", "C", "O", "CA"]])
                 chains.append([chain_id])
                 cas.append(residue["CA"].coord)
                 cbs.append(cb)
@@ -128,10 +134,12 @@ def read_pdb_to_protbb(pdb_file: str):
                         ]
                     )
                 )
-    return ProtBB(cas, cbs, cs, os, ns, seqs, resseqs, chains, bb_ang, sasa)
+                sadic.append(np.array([residue["CA"].get_bfactor(), cb_sadic] + [residue[atom_name].get_bfactor() for atom_name in ["N", "C", "O"]]))
+
+    return ProtBB(cas, cbs, cs, ns, os, seqs, resseqs, chains, bb_ang, sasa, sadic)
 
 
-def get_neighbor_old(protbb, neighbor: int = 32, noise_level=0.0, train=False):
+"""def get_neighbor_old(protbb, neighbor: int = 32, noise_level=0.0, train=False):
     # L, 1, 3
     L = len(protbb.ca)
     if L < neighbor:
@@ -185,11 +193,12 @@ def get_neighbor_old(protbb, neighbor: int = 32, noise_level=0.0, train=False):
     nodes = torch.cat((F.one_hot(seq_toks.long(), 22), bb_ang), dim=-1).transpose(1, 0)
     edge = torch.cat((dis, pos_num.unsqueeze(-1), chain_id.unsqueeze(-1)), dim=-1)
 
-    return nodes, edge.transpose(1, 0), protbb.seq.squeeze(-1).long()
+    return nodes, edge.transpose(1, 0), protbb.seq.squeeze(-1).long()"""
 
 
-def get_neighbor(protbb, neighbor: int = 32, noise_level=0.0, train=False):
+def get_neighbor(protbb, neighbor: int = 32, noise_level=0.0, train=False, enable_sadic=False):
     L = len(protbb.ca)
+    assert L != 0
 
     # 1. Pad sequence if it's shorter than the number of neighbors
     if L < neighbor:
@@ -208,6 +217,10 @@ def get_neighbor(protbb, neighbor: int = 32, noise_level=0.0, train=False):
             zero_prot.chain_num[:L],
             zero_prot.bb_ang[:L],
         ) = (protbb.seq, protbb.resseq, protbb.chain_num, protbb.bb_ang)
+
+        if enable_sadic:
+            zero_prot.sadic[:L] = protbb.sadic
+
         protbb = zero_prot
         L = neighbor
 
@@ -223,37 +236,39 @@ def get_neighbor(protbb, neighbor: int = 32, noise_level=0.0, train=False):
 
     # 3. Compute edge features on-demand for neighbors only
     # Squeeze feature tensors from [L, 1] to [L] for easier indexing
-    resseq_flat = protbb.resseq.squeeze(-1)
-    chain_num_flat = protbb.chain_num.squeeze(-1)
+    resseq_flat = protbb.resseq.squeeze(-1) # Residue index
+    chain_num_flat = protbb.chain_num.squeeze(-1) # Chain index
 
     # Use advanced indexing to directly get features of neighbors
-    neighbor_resseq = resseq_flat[indices]  # Shape: [L, k]
-    neighbor_chains = chain_num_flat[indices]  # Shape: [L, k]
+    neighbor_resseq = resseq_flat[indices]  # Shape: [L, k] # Residue index of the neighbours
+    neighbor_chains = chain_num_flat[indices]  # Shape: [L, k] # Chain index of the neighbours
 
     # Calculate relative values by broadcasting [L, k] and [L, 1] tensors
-    pos_num = torch.clamp(neighbor_resseq - resseq_flat.unsqueeze(1), min=-32, max=32)
-    chain_id = (neighbor_chains - chain_num_flat.unsqueeze(1)).int()
+    pos_num = torch.clamp(neighbor_resseq - resseq_flat.unsqueeze(1), min=-32, max=32) # Relative residue position of neighbours # TODO: WHY CLAMPING?
+    chain_id = (neighbor_chains - chain_num_flat.unsqueeze(1)).int() # Relative chain index of neighbours
 
     # 4. Compute node features on-demand for neighbors only
-    seq_flat = protbb.seq.squeeze(-1)
+    seq_flat = protbb.seq.squeeze(-1) # Sequence of residue labels
 
     # Directly index to get neighbor sequence tokens and angles
-    seq_toks = seq_flat[indices]  # Shape: [L, k]
-    bb_ang = protbb.bb_ang[indices]  # Shape: [L, k, 6]
+    seq_toks = seq_flat[indices]  # Shape: [L, k] # For each residue, the type of neighbour residues
+    bb_ang = protbb.bb_ang[indices]  # Shape: [L, k, 6] # For each residue, the angles of neighbour residues
+    if enable_sadic:
+        bb_sadic = protbb.sadic[indices]  # Shape: [L, k, 5] # For each residue, the SADIC of neighbour residues
 
     # Masking logic (same as original)
     if train:
-        mask_prob = torch.rand(L, device=protbb.ca.device)
+        mask_prob = torch.rand(L, device=protbb.ca.device) # Shape: [L] # Mask probability
         random_toks = torch.randint(0, 20, (L,), device=protbb.ca.device)
         # Use torch.where for a cleaner conditional assignment
-        seq_toks[:, 0] = torch.where(mask_prob < 0.85, 21, random_toks)
+        seq_toks[:, 0] = torch.where(mask_prob < 0.85, 21, random_toks) # Assign to the central node, a random label or the <mask> label (21)
     else:
-        seq_toks[:, 0] = 21
+        seq_toks[:, 0] = 21 # In inference, mask all central residues
 
     # 5. Efficiently compute backbone atom distances (most significant optimization)
     bb_coords = torch.cat(
         (protbb.ca, protbb.cb, protbb.c, protbb.n, protbb.o), dim=-2
-    )  # Shape: [L, 5, 3]
+    )  # Shape: [L, 5, 3] # Stack atom coordinates
     if noise_level > 0.0:
         bb_coords += torch.rand_like(bb_coords) * noise_level
 
@@ -265,14 +280,17 @@ def get_neighbor(protbb, neighbor: int = 32, noise_level=0.0, train=False):
     # Compute distances only on the [L, k] subset
     # Broadcasting [L, 1, 5, 1, 3] and [L, k, 1, 5, 3] results in [L, k, 5, 5, 3]
     d_x = center_coords.unsqueeze(3) - neighbor_coords.unsqueeze(2)
-    dis = torch.sqrt(torch.square(d_x).sum(dim=-1)).reshape(L, neighbor, 25)
+    dis = torch.sqrt(torch.square(d_x).sum(dim=-1)).reshape(L, neighbor, 25) # Shape: [L, k, 25]
 
     # 6. Combine final outputs (logic is same as original)
-    nodes = torch.cat((F.one_hot(seq_toks.long(), 22), bb_ang), dim=-1)
-    edge = torch.cat((dis, pos_num.unsqueeze(-1), chain_id.unsqueeze(-1)), dim=-1)
+    if enable_sadic:
+        nodes = torch.cat((F.one_hot(seq_toks.long(), 22), bb_ang, bb_sadic), dim=-1) # Shape: [L, k, 22 + 6 + 5]
+    else:
+        nodes = torch.cat((F.one_hot(seq_toks.long(), 22), bb_ang), dim=-1) # Shape: [L, k, 22 + 6]
+    edge = torch.cat((dis, pos_num.unsqueeze(-1), chain_id.unsqueeze(-1)), dim=-1) # Shape: [L, k, 25 + 1 + 1]
 
     # Return transposed results
-    return nodes.transpose(1, 0), edge.transpose(1, 0), protbb.seq.squeeze(-1).long()
+    return nodes.transpose(1, 0), edge.transpose(1, 0), protbb.seq.squeeze(-1).long() # Nodes, edges, labels
 
 
 def parallel_converter(pdb):
@@ -297,6 +315,7 @@ class myDataset(Dataset):
         noise=0.0,
         neighbor=32,
         max_length=4000,
+        enable_sadic=False,
     ) -> None:
         super().__init__()
         self.protbbs = protbbs
@@ -305,6 +324,7 @@ class myDataset(Dataset):
         self.noise = noise
         self.neighbor = neighbor
         self.max_length = max_length
+        self.enable_sadic = enable_sadic
 
     def make_metabatch(self):
         self.batchs = []
@@ -330,7 +350,7 @@ class myDataset(Dataset):
         targets = []
         for protbb in batch:
             node, edge, target = get_neighbor(
-                protbb, neighbor=self.neighbor, noise_level=self.noise
+                protbb, neighbor=self.neighbor, noise_level=self.noise, enable_sadic=self.enable_sadic
             )
             nodes.append(node)
             edges.append(edge)

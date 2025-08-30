@@ -86,13 +86,20 @@ def make_one_scan(pdb_file, torch_models: list, device, save_pt=False):
 
 
 def main():
-    args = parse_args()
+    """args = parse_args()
     input_dir = args.input_dir
     pdb_filename = args.pdb_filename
     check_plddt = args.check_plddt
     plddt_cutoff = args.plddt_cutoff
     n_jobs = args.n_jobs
-    device = args.device
+    device = args.device"""
+
+    input_dir = ""
+    pdb_filename = "/repo/nunziati/sadic_stab/pythia-sadic/examples/1pga.pdb"
+    check_plddt = False
+    plddt_cutoff = 95
+    n_jobs = 2
+    device = "cuda:0"
 
     run_dir = bool(input_dir)
 
@@ -137,7 +144,7 @@ def parse_args():
     parser.add_argument(
         "--pdb_filename",
         type=str,
-        default=None,
+        default="examples/1pga.pdb",
         help="Path to a specific PDB filename.",
     )
     parser.add_argument(
